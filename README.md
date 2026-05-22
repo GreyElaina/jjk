@@ -7,6 +7,24 @@
 [![VS Code Extension](https://img.shields.io/visual-studio-marketplace/v/jjk.jjk)](https://marketplace.visualstudio.com/items?itemName=jjk.jjk)
 [![Discord](https://img.shields.io/discord/968932220549103686?color=5865F2&label=Discord&logo=discord&logoColor=white)](https://discord.gg/BqBjUVerfq)
 
+## Fork notes
+
+This repository is a fork-oriented build of Jujutsu Kaizen. It keeps the core
+goal of a native-feeling jj workflow in VS Code, while carrying local changes
+that may differ from upstream extension behavior.
+
+Notable fork changes include:
+
+- jj-style move actions in the diff gutter toolbar for moving hunks or selected
+  ranges between the Working Copy and parent changes.
+- Native VS Code restore/revert gutter actions are left to VS Code itself
+  instead of being duplicated by this extension.
+- The development build prepares the native fake editor binary used by
+  interactive jj operations.
+
+When reporting behavior differences, please include whether the issue happens
+in this fork build or in the upstream extension as well.
+
 ## 🚀 Features
 
 The goal of this extension is to bring the great UX of Jujutsu into the VS Code UI. We are currently focused on achieving parity for commonly used features of VS Code's built-in Git extension, such as the various operations possible via the Source Control view.

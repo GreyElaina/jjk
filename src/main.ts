@@ -6,7 +6,12 @@ import {
   provideOriginalResource,
   WorkspaceSourceControlManager,
 } from "./repository";
-import type { JJRepository, ChangeWithDetails, FileStatus } from "./repository";
+import type {
+  JJRepository,
+  ChangeWithDetails,
+  FileStatus,
+  RepositoryStatus,
+} from "./repository";
 import { JJDecorationProvider } from "./decorationProvider";
 import {
   OperationLogManager,
@@ -1102,11 +1107,218 @@ export async function activate(context: vscode.ExtensionContext) {
       }),
     );
 
+    async function selectSquashDestination(
+      repository: JJRepository,
+      status: Awaited<ReturnType<JJRepository["status"]>>,
+      placeHolder: string,
+    ): Promise<string | undefined> {
+      const items: ({ changeId: string } & vscode.QuickPickItem)[] = [];
+
+      try {
+        const childChanges = (
+          await repository.log("all:@+", 'change_id ++ "\n"', undefined, true)
+        ).trim();
+
+        if (childChanges) {
+          items.push(
+            ...(await Promise.all(
+              childChanges.split("\n").map(async (changeId) => {
+                const show = await repository.show(changeId);
+                return {
+                  label: `$(arrow-up) Child: ${changeId.substring(0, 8)}`,
+                  description: show.change.description || "(no description)",
+                  alwaysShow: true,
+                  changeId,
+                };
+              }),
+            )),
+          );
+        }
+      } catch (_) {
+        // No child changes or error, continue with just parents.
+      }
+
+      for (const parent of status.parentChanges) {
+        items.push({
+          label: `$(arrow-down) Parent: ${parent.changeId.substring(0, 8)}`,
+          description: parent.description || "(no description)",
+          alwaysShow: true,
+          changeId: parent.changeId,
+        });
+      }
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder,
+        ignoreFocusOut: true,
+      });
+
+      return selected?.changeId;
+    }
+
+    async function selectMoveDestination(
+      status: Awaited<ReturnType<JJRepository["status"]>>,
+    ): Promise<string | undefined> {
+      if (status.parentChanges.length === 0) {
+        throw new Error("No parent changes found");
+      }
+
+      if (status.parentChanges.length === 1) {
+        return status.parentChanges[0].changeId;
+      }
+
+      const selection = await vscode.window.showQuickPick(
+        status.parentChanges.map((parent) => ({
+          label: parent.changeId,
+          description: parent.description || "(no description)",
+          parent,
+        })),
+        {
+          placeHolder: "Select parent to move into",
+          ignoreFocusOut: true,
+        },
+      );
+
+      return selection?.parent.changeId;
+    }
+
+    function getWorkingCopyDiffSource(
+      textEditor: vscode.TextEditor,
+      status: RepositoryStatus,
+    ):
+      | {
+          diffComputer: ILinesDiffComputer;
+          originalUri: vscode.Uri;
+        }
+      | undefined {
+      const diffInput = getActiveTextEditorDiff();
+      const originalParams = diffInput
+        ? tryGetParams(diffInput.original)
+        : undefined;
+
+      if (
+        diffInput &&
+        diffInput.modified.scheme === "file" &&
+        diffInput.modified.toString() === textEditor.document.uri.toString() &&
+        diffInput.original.scheme === "jj" &&
+        match({})
+          .case({ diffOriginalRev: "string" }, ({ diffOriginalRev }) =>
+            isWorkingCopyRev(status, diffOriginalRev),
+          )
+          .default(() => false)(originalParams)
+      ) {
+        return {
+          diffComputer: linesDiffComputers.getDefault(),
+          originalUri: diffInput.original,
+        };
+      }
+
+      if (textEditor.document.uri.scheme === "file") {
+        return {
+          diffComputer: linesDiffComputers.getLegacy(),
+          originalUri: toJJUri(textEditor.document.uri, {
+            diffOriginalRev: status.workingCopy.commitId,
+          }),
+        };
+      }
+
+      return undefined;
+    }
+
+    async function getWorkingCopyLineChanges(
+      diffComputer: ILinesDiffComputer,
+      originalUri: vscode.Uri,
+      modifiedDocument: vscode.TextDocument,
+    ): Promise<{
+      originalDocument: vscode.TextDocument;
+      lineChanges: LineChange[];
+    }> {
+      const originalDocument =
+        await vscode.workspace.openTextDocument(originalUri);
+      const originalLines = originalDocument.getText().split("\n");
+      const editorLines = modifiedDocument.getText().split("\n");
+      const diff = diffComputer.computeDiff(originalLines, editorLines, {
+        ignoreTrimWhitespace: false,
+        maxComputationTimeMs: 5000,
+        computeMoves: false,
+      });
+
+      return {
+        originalDocument,
+        lineChanges: toLineChanges(diff),
+      };
+    }
+
+    async function squashLineChanges(
+      repository: JJRepository,
+      originalDocument: vscode.TextDocument,
+      textEditor: vscode.TextEditor,
+      selectedChanges: LineChange[],
+      destinationRev: string,
+    ) {
+      const result = applyLineChanges(
+        originalDocument,
+        textEditor.document,
+        selectedChanges,
+      );
+
+      await repository.squashContentRetryImmutable({
+        fromRev: "@",
+        toRev: destinationRev,
+        content: result,
+        filepath: localFsPath(originalDocument.uri),
+      });
+    }
+
+    async function moveGutterChanges(
+      changes: DiffEditorSelectionHunkToolbarContext,
+    ) {
+      logger.info(
+        `Move gutter changes: ${JSON.stringify(describeGutterContext(changes))}`,
+      );
+
+      const modifiedPath = localFsPath(changes.modifiedUri);
+
+      const repository = workspaceSCM.getRepositoryFromUri(
+        vscode.Uri.file(modifiedPath),
+      );
+      if (!repository) {
+        throw new Error(`Repository not found for ${modifiedPath}`);
+      }
+
+      const status = await repository.status(true);
+      const squash = getGutterSquashOperation(changes, status);
+      if (!squash) {
+        throw new Error(
+          `Unsupported gutter URI pair: original=${changes.originalUri.toString()}, modified=${changes.modifiedUri.toString()}`,
+        );
+      }
+
+      const destinationRev =
+        squash.toRev ?? (await selectMoveDestination(status));
+
+      if (!destinationRev) {
+        return;
+      }
+
+      await repository.squashContentRetryImmutable({
+        fromRev: squash.fromRev,
+        toRev: destinationRev,
+        content: changes.originalWithModifiedChanges,
+        filepath: squash.filepath,
+      });
+    }
+
     context.subscriptions.push(
-      vscode.commands.registerCommand("jj.squashSelectedRanges", async () => {
-        // this is based on the Git extension's git.stageSelectedRanges function
-        // https://github.com/microsoft/vscode/blob/bd05fbbcb0dbc153f85dd118b5729bde34b91f2f/extensions/git/src/commands.ts#L1646
+      vscode.commands.registerCommand("jj.squashSelectedRanges", async (
+        changes?: DiffEditorSelectionHunkToolbarContext,
+      ) => {
+        // This is based on the Git extension's git.squashSelectedRanges command.
         try {
+          if (changes) {
+            await moveGutterChanges(changes);
+            return;
+          }
+
           const textEditor = vscode.window.activeTextEditor;
           if (!textEditor) {
             return;
@@ -1119,150 +1331,151 @@ export async function activate(context: vscode.ExtensionContext) {
             return;
           }
 
-          const items: ({ changeId: string } & vscode.QuickPickItem)[] = [];
-
-          try {
-            const childChanges = await repository.log(
-              "all:@+",
-              'change_id ++ "\n"',
-              undefined,
-              true,
-            );
-
-            items.push(
-              ...(await Promise.all(
-                childChanges
-                  .trim()
-                  .split("\n")
-                  .map(async (changeId) => {
-                    const show = await repository.show(changeId);
-                    return {
-                      label: `$(arrow-up) Child: ${changeId.substring(0, 8)}`,
-                      description:
-                        show.change.description || "(no description)",
-                      alwaysShow: true,
-                      changeId,
-                    };
-                  }),
-              )),
-            );
-          } catch (_) {
-            // No child changes or error, continue with just parents
-          }
-
           const status = await repository.status(true);
-          for (const parent of status.parentChanges) {
-            items.push({
-              label: `$(arrow-down) Parent: ${parent.changeId.substring(0, 8)}`,
-              description: parent.description || "(no description)",
-              alwaysShow: true,
-              changeId: parent.changeId,
-            });
-          }
-
-          const selected = await vscode.window.showQuickPick(items, {
-            placeHolder:
-              "Select destination change for squashing selected lines",
-            ignoreFocusOut: true,
-          });
-
-          if (!selected) {
+          const diffSource = getWorkingCopyDiffSource(textEditor, status);
+          if (!diffSource) {
+            vscode.window.showErrorMessage(
+              "Selected range squash is only available from a working copy file or the modified side of a working copy diff.",
+            );
             return;
           }
 
-          const destinationRev = selected.changeId;
+          const destinationRev = await selectSquashDestination(
+            repository,
+            status,
+            "Select destination change for squashing selected lines",
+          );
 
-          async function computeAndSquashSelectedDiff(
-            repository: JJRepository,
-            diffComputer: ILinesDiffComputer,
-            originalUri: vscode.Uri,
-            textEditor: vscode.TextEditor,
-          ) {
-            const originalDocument =
-              await vscode.workspace.openTextDocument(originalUri);
-            const originalLines = originalDocument.getText().split("\n");
-            const editorLines = textEditor.document.getText().split("\n");
-            const diff = diffComputer.computeDiff(originalLines, editorLines, {
-              ignoreTrimWhitespace: false,
-              maxComputationTimeMs: 5000,
-              computeMoves: false,
-            });
-
-            const lineChanges = toLineChanges(diff);
-            const selectedLines = toLineRanges(
-              textEditor.selections,
-              textEditor.document,
-            );
-            const selectedChanges = lineChanges
-              .map((change) =>
-                selectedLines.reduce<LineChange | null>(
-                  (result, range) =>
-                    result ||
-                    intersectDiffWithRange(textEditor.document, change, range),
-                  null,
-                ),
-              )
-              .filter((d) => !!d);
-
-            if (!selectedChanges.length) {
-              vscode.window.showErrorMessage(
-                "The selection range does not contain any changes.",
-              );
-              return;
-            }
-
-            const result = applyLineChanges(
-              originalDocument,
-              textEditor.document,
-              selectedChanges,
-            );
-
-            await repository.squashContentRetryImmutable({
-              fromRev: "@",
-              toRev: destinationRev,
-              content: result,
-              filepath: originalUri.fsPath,
-            });
+          if (!destinationRev) {
+            return;
           }
 
-          const diffInput = getActiveTextEditorDiff();
+          const { originalDocument, lineChanges } =
+            await getWorkingCopyLineChanges(
+              diffSource.diffComputer,
+              diffSource.originalUri,
+              textEditor.document,
+            );
+          const selectedLines = toLineRanges(
+            textEditor.selections,
+            textEditor.document,
+          );
+          const selectedChanges = lineChanges
+            .map((change) =>
+              selectedLines.reduce<LineChange | null>(
+                (result, range) =>
+                  result ||
+                  intersectDiffWithRange(textEditor.document, change, range),
+                null,
+              ),
+            )
+            .filter((d): d is LineChange => !!d);
 
-          if (
-            diffInput &&
-            diffInput.modified.scheme === "file" &&
-            diffInput.original.scheme === "jj" &&
-            match({})
-              .case({ diffOriginalRev: "string" }, ({ diffOriginalRev }) =>
-                [
-                  "@",
-                  status.workingCopy.changeId,
-                  status.workingCopy.commitId,
-                ].includes(diffOriginalRev),
-              )
-              .default(() => false)(getParams(diffInput.original))
-          ) {
-            await computeAndSquashSelectedDiff(
-              repository,
-              linesDiffComputers.getDefault(),
-              diffInput.original,
-              textEditor,
+          if (!selectedChanges.length) {
+            vscode.window.showErrorMessage(
+              "The selection range does not contain any changes.",
             );
-          } else if (textEditor.document.uri.scheme === "file") {
-            await computeAndSquashSelectedDiff(
-              repository,
-              linesDiffComputers.getLegacy(),
-              toJJUri(textEditor.document.uri, {
-                diffOriginalRev: status.workingCopy.commitId,
-              }),
-              textEditor,
-            );
+            return;
           }
+
+          await squashLineChanges(
+            repository,
+            originalDocument,
+            textEditor,
+            selectedChanges,
+            destinationRev,
+          );
         } catch (error) {
           vscode.window.showErrorMessage(
             `Failed to squash selection${error instanceof Error ? `: ${error.message}` : ""}`,
           );
         }
       }),
+    );
+
+    context.subscriptions.push(
+      vscode.commands.registerCommand("jj.diff.moveHunkToParent", async (
+        changes?: DiffEditorSelectionHunkToolbarContext,
+      ) => {
+        try {
+          logger.info(
+            `Command jj.diff.moveHunkToParent invoked with context=${String(!!changes)}`,
+          );
+          if (changes) {
+            await moveGutterChanges(changes);
+            return;
+          }
+
+          throw new Error("No gutter hunk context.");
+        } catch (error) {
+          vscode.window.showErrorMessage(
+            `Failed to move hunk to parent${error instanceof Error ? `: ${error.message}` : ""}`,
+          );
+        }
+      }),
+    );
+
+    context.subscriptions.push(
+      vscode.commands.registerCommand(
+        "jj.diff.moveSelectionToParent",
+        async (changes?: DiffEditorSelectionHunkToolbarContext) => {
+          try {
+            logger.info(
+              `Command jj.diff.moveSelectionToParent invoked with context=${String(!!changes)}`,
+            );
+            if (!changes) {
+              throw new Error("No gutter selection context.");
+            }
+            await moveGutterChanges(changes);
+          } catch (error) {
+            vscode.window.showErrorMessage(
+              `Failed to move selection to parent${error instanceof Error ? `: ${error.message}` : ""}`,
+            );
+          }
+        },
+      ),
+    );
+
+    context.subscriptions.push(
+      vscode.commands.registerCommand(
+        "jj.diff.moveHunkToWorkingCopy",
+        async (changes?: DiffEditorSelectionHunkToolbarContext) => {
+          try {
+            logger.info(
+              `Command jj.diff.moveHunkToWorkingCopy invoked with context=${String(!!changes)}`,
+            );
+            if (!changes) {
+              throw new Error("No gutter hunk context.");
+            }
+            await moveGutterChanges(changes);
+          } catch (error) {
+            vscode.window.showErrorMessage(
+              `Failed to move hunk to working copy${error instanceof Error ? `: ${error.message}` : ""}`,
+            );
+          }
+        },
+      ),
+    );
+
+    context.subscriptions.push(
+      vscode.commands.registerCommand(
+        "jj.diff.moveSelectionToWorkingCopy",
+        async (changes?: DiffEditorSelectionHunkToolbarContext) => {
+          try {
+            logger.info(
+              `Command jj.diff.moveSelectionToWorkingCopy invoked with context=${String(!!changes)}`,
+            );
+            if (!changes) {
+              throw new Error("No gutter selection context.");
+            }
+            await moveGutterChanges(changes);
+          } catch (error) {
+            vscode.window.showErrorMessage(
+              `Failed to move selection to working copy${error instanceof Error ? `: ${error.message}` : ""}`,
+            );
+          }
+        },
+      ),
     );
 
     context.subscriptions.push(
@@ -1800,6 +2013,101 @@ interface LineChange {
   readonly modifiedEndLineNumber: number;
 }
 
+interface DiffEditorSelectionHunkToolbarContext {
+  readonly mapping: unknown;
+  readonly originalWithModifiedChanges: string;
+  readonly modifiedUri: vscode.Uri;
+  readonly originalUri: vscode.Uri;
+}
+
+function describeGutterContext(changes: DiffEditorSelectionHunkToolbarContext) {
+  return {
+    originalScheme: changes.originalUri.scheme,
+    modifiedScheme: changes.modifiedUri.scheme,
+    originalPath: changes.originalUri.fsPath,
+    modifiedPath: changes.modifiedUri.fsPath,
+    hasOriginalWithModifiedChanges:
+      typeof changes.originalWithModifiedChanges === "string",
+    mapping: changes.mapping,
+  };
+}
+
+function tryGetParams(uri: vscode.Uri) {
+  try {
+    return getParams(uri);
+  } catch {
+    return undefined;
+  }
+}
+
+function localFsPath(uri: vscode.Uri): string {
+  if (uri.scheme === "file") {
+    return uri.fsPath;
+  }
+
+  if (process.platform === "win32" && /^\/[a-zA-Z]:\//.test(uri.fsPath)) {
+    return uri.fsPath.slice(1);
+  }
+
+  return uri.fsPath;
+}
+
+function isWorkingCopyRev(status: RepositoryStatus, rev: string): boolean {
+  return [
+    "@",
+    status.workingCopy.changeId,
+    status.workingCopy.commitId,
+  ].includes(rev);
+}
+
+function isParentRev(status: RepositoryStatus, rev: string): boolean {
+  return status.parentChanges.some(
+    (parent) => parent.changeId === rev || parent.commitId === rev,
+  );
+}
+
+function getGutterSquashOperation(
+  changes: DiffEditorSelectionHunkToolbarContext,
+  status: RepositoryStatus,
+): { fromRev: string; toRev?: string; filepath: string } | undefined {
+  if (changes.originalUri.scheme !== "jj") {
+    return undefined;
+  }
+
+  const originalParams = tryGetParams(changes.originalUri);
+  if (!originalParams || !("diffOriginalRev" in originalParams)) {
+    return undefined;
+  }
+
+  const filepath = localFsPath(changes.modifiedUri);
+
+  if (changes.modifiedUri.scheme === "file") {
+    if (!isWorkingCopyRev(status, originalParams.diffOriginalRev)) {
+      return undefined;
+    }
+
+    return { fromRev: "@", filepath };
+  }
+
+  if (changes.modifiedUri.scheme === "jj") {
+    const modifiedParams = tryGetParams(changes.modifiedUri);
+    if (
+      modifiedParams &&
+      "rev" in modifiedParams &&
+      originalParams.diffOriginalRev === modifiedParams.rev &&
+      isParentRev(status, modifiedParams.rev)
+    ) {
+      return {
+        fromRev: modifiedParams.rev,
+        toRev: "@",
+        filepath,
+      };
+    }
+  }
+
+  return undefined;
+}
+
 function intersectDiffWithRange(
   textDocument: vscode.TextDocument,
   diff: LineChange,
@@ -1849,15 +2157,9 @@ function getModifiedRange(
 ): vscode.Range {
   if (diff.modifiedEndLineNumber === 0) {
     if (diff.modifiedStartLineNumber === 0) {
-      return new vscode.Range(
-        textDocument.lineAt(diff.modifiedStartLineNumber).range.end,
-        textDocument.lineAt(diff.modifiedStartLineNumber).range.start,
-      );
+      return textDocument.lineAt(0).range;
     } else if (textDocument.lineCount === diff.modifiedStartLineNumber) {
-      return new vscode.Range(
-        textDocument.lineAt(diff.modifiedStartLineNumber - 1).range.end,
-        textDocument.lineAt(diff.modifiedStartLineNumber - 1).range.end,
-      );
+      return textDocument.lineAt(diff.modifiedStartLineNumber - 1).range;
     } else {
       return new vscode.Range(
         textDocument.lineAt(diff.modifiedStartLineNumber - 1).range.end,

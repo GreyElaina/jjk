@@ -9,6 +9,9 @@
     "vscode": "^1.96.0",
     "npm": ">=11.10.0"
   },
+  "enabledApiProposals": [
+    "contribDiffEditorGutterToolBarMenus"
+  ],
   "categories": [
     "SCM Providers"
   ],
@@ -18,6 +21,7 @@
   },
   "activationEvents": [
     "*",
+    "onFileSystem:jj",
     "onEditSession:file"
   ],
   "main": "./dist/main.js",
@@ -184,8 +188,32 @@
       },
       {
         "command": "jj.squashSelectedRanges",
-        "title": "Squash selected changes...",
+        "title": "Squash selected changes",
         "category": "Jujutsu"
+      },
+      {
+        "command": "jj.diff.moveHunkToParent",
+        "title": "Move hunk to parent",
+        "category": "Jujutsu",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "jj.diff.moveSelectionToParent",
+        "title": "Move selection to parent",
+        "category": "Jujutsu",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "jj.diff.moveHunkToWorkingCopy",
+        "title": "Move hunk to working copy",
+        "category": "Jujutsu",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "jj.diff.moveSelectionToWorkingCopy",
+        "title": "Move selection to working copy",
+        "category": "Jujutsu",
+        "icon": "$(arrow-up)"
       },
       {
         "command": "jj.openParentChange",
@@ -236,6 +264,30 @@
         {
           "command": "jj.squashSelectedRanges",
           "when": "jj.reposExist && editorTextFocus && editorHasSelection && !editorReadonly"
+        }
+      ],
+      "diffEditor/gutter/hunk": [
+        {
+          "command": "jj.diff.moveHunkToParent",
+          "group": "primary@10",
+          "when": "jj.reposExist && diffEditorOriginalUri =~ /^jj\\:/ && diffEditorModifiedUri =~ /^file\\:/"
+        },
+        {
+          "command": "jj.diff.moveHunkToWorkingCopy",
+          "group": "primary@10",
+          "when": "jj.reposExist && diffEditorOriginalUri =~ /^jj\\:/ && diffEditorModifiedUri =~ /^jj\\:/"
+        }
+      ],
+      "diffEditor/gutter/selection": [
+        {
+          "command": "jj.diff.moveSelectionToParent",
+          "group": "primary@10",
+          "when": "jj.reposExist && diffEditorOriginalUri =~ /^jj\\:/ && diffEditorModifiedUri =~ /^file\\:/"
+        },
+        {
+          "command": "jj.diff.moveSelectionToWorkingCopy",
+          "group": "primary@10",
+          "when": "jj.reposExist && diffEditorOriginalUri =~ /^jj\\:/ && diffEditorModifiedUri =~ /^jj\\:/"
         }
       ],
       "view/title": [
@@ -434,6 +486,22 @@
           "when": "false"
         },
         {
+          "command": "jj.diff.moveHunkToParent",
+          "when": "false"
+        },
+        {
+          "command": "jj.diff.moveSelectionToParent",
+          "when": "false"
+        },
+        {
+          "command": "jj.diff.moveHunkToWorkingCopy",
+          "when": "false"
+        },
+        {
+          "command": "jj.diff.moveSelectionToWorkingCopy",
+          "when": "false"
+        },
+        {
           "command": "jj.openParentChange",
           "when": "false"
         },
@@ -625,9 +693,10 @@
   "scripts": {
     "build": "npm run check-types && npm run lint && node esbuild.js --production && cp -r src/webview dist/ && cp src/config.toml dist/ && mkdir -p dist/codicons && cp -r node_modules/@vscode/codicons/dist/* dist/codicons/ && npm run build:fakeeditor && mkdir -p dist/fakeeditor/zig-out/bin && cp -r src/fakeeditor/zig-out/bin/. dist/fakeeditor/zig-out/bin/",
     "build:fakeeditor": "cd src/fakeeditor && ./build_all_platforms.sh",
+    "build:fakeeditor:native": "node -e \"const {spawnSync}=require('child_process'); const targets={darwin:{arm64:'aarch64-macos',x64:'x86_64-macos'},linux:{arm:'arm-linux',arm64:'aarch64-linux',x64:'x86_64-linux'},win32:{arm64:'aarch64-windows',x64:'x86_64-windows'}}; const target=targets[process.platform]?.[process.arch]; if(!target) throw new Error('Unsupported fakeeditor target: '+process.platform+'/'+process.arch); const result=spawnSync('zig',['build','-Doptimize=ReleaseSmall','-Dtarget='+target,'--release=small','--summary','all'],{cwd:'src/fakeeditor',stdio:'inherit'}); if(result.error) throw result.error; process.exit(result.status ?? 1);\"",
     "vscode:prepublish": "npm run build",
-    "compile": "npm run check-types && npm run lint && node esbuild.js",
-    "watch": "npm-run-all -p watch:*",
+    "compile": "npm run check-types && npm run lint && node esbuild.js && npm run build:fakeeditor:native",
+    "watch": "npm run build:fakeeditor:native && npm-run-all -p watch:*",
     "watch:esbuild": "node esbuild.js --watch",
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
     "compile-tests": "node esbuild.js --test",
